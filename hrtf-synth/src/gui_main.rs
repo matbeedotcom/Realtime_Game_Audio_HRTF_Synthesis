@@ -2,6 +2,8 @@
 //!
 //! Graphical interface for generating personalized HRTFs from anthropometric measurements.
 
+#![windows_subsystem = "windows"]
+
 use hrtf_synth::gui::HrtfApp;
 
 fn main() -> eframe::Result<()> {

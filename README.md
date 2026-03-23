@@ -1,5 +1,7 @@
 # Individualized HRTF Synthesis
 
+A standalone Rust re-implementation of [Carvalho, D. R. (2021) — *Synthesis of individualized HRTFs based on Neural Networks, Principal Component Analysis and anthropometry*](https://github.com/davircarvalho/Individualized_HRTF_Synthesis). No MATLAB required.
+
 Generate personalized Head-Related Transfer Functions (HRTFs) from your body measurements — then use them with [HeSuVi](https://sourceforge.net/projects/hesuvi/) for better positional audio in games, music, and VR.
 
 ## Quick Start

@@ -1,5 +1,5 @@
 [workspace]
-members = ["hrtf-synth", "hrtf-apo", "hrtf-apo-installer"]
+members = ["hrtf-synth", "hrtf-apo"]
 resolver = "2"
 
 [profile.release]

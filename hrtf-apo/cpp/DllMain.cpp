@@ -135,6 +135,39 @@ static LSTATUS MakeWritable(HKEY root, LPCWSTR subkey)
     return st;
 }
 
+// Save original SFX CLSID to file for uninstall
+static void SaveOriginalSfx(LPCWSTR endpointSubkey, LPCWSTR endpointGuid)
+{
+    wchar_t fxPath[512];
+    _snwprintf_s(fxPath, 512, L"%s\\FxProperties", endpointSubkey);
+
+    HKEY hKey;
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, fxPath, 0, KEY_QUERY_VALUE | KEY_WOW64_64KEY, &hKey) != ERROR_SUCCESS)
+        return;
+
+    const wchar_t* sfxKeyName = L"{d04e05a6-594b-4fb6-a80d-01af5eed7d1d},5";
+    wchar_t existingClsid[128] = {};
+    DWORD size = sizeof(existingClsid);
+    DWORD type = 0;
+
+    if (RegQueryValueExW(hKey, sfxKeyName, NULL, &type, (BYTE*)existingClsid, &size) == ERROR_SUCCESS)
+    {
+        // Don't save if it's already our CLSID
+        if (_wcsicmp(existingClsid, L"{A1B2C3D4-E5F6-7890-ABCD-EF0123456789}") != 0)
+        {
+            // Write endpoint GUID + original CLSID to file
+            FILE* f = nullptr;
+            fopen_s(&f, "C:\\ProgramData\\HrtfApo\\original_sfx.txt", "w");
+            if (f) {
+                fwprintf(f, L"%s\n%s\n", endpointGuid, existingClsid);
+                fclose(f);
+                DebugLog("Saved original SFX CLSID for uninstall");
+            }
+        }
+    }
+    RegCloseKey(hKey);
+}
+
 // Write SFX CLSID to FxProperties (EqualizerAPO DeviceAPOInfo::install pattern)
 static LSTATUS WriteFxProperties(LPCWSTR endpointSubkey)
 {
@@ -295,7 +328,10 @@ extern "C" __declspec(dllexport) void __stdcall InstallForEndpoint(
     snprintf(buf, sizeof(buf), "MakeWritable FxProperties: %ld", st);
     DebugLog(buf);
 
-    // Step 5: Write our CLSID to FxProperties
+    // Step 5: Save original SFX CLSID before overwriting
+    SaveOriginalSfx(endpointKey, wideCmdLine);
+
+    // Step 6: Write our CLSID to FxProperties
     st = WriteFxProperties(endpointKey);
     snprintf(buf, sizeof(buf), "WriteFxProperties: %ld", st);
     DebugLog(buf);

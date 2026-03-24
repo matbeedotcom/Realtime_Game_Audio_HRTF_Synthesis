@@ -47,13 +47,16 @@ pub struct HrtfApp {
     // APO export status
     apo_export_message: Option<(bool, String)>, // (is_success, message)
 
-    // APO endpoint picker
-    apo_endpoints: Vec<(u32, String)>,
-    apo_selected_endpoint: Option<u32>,
+    // APO endpoint picker: (index, endpoint_guid, friendly_name)
+    apo_endpoints: Vec<(u32, String, String)>,
+    apo_selected_endpoint: Option<usize>,
 
     // APO bypass control (shared memory toggle)
     bypass_control: Option<apo_install::BypassControl>,
     hrtf_enabled: bool,
+
+    // Background APO operation (so UAC + elevated calls don't freeze the GUI)
+    apo_pending: Option<std::sync::Arc<std::sync::Mutex<Option<Result<String, String>>>>>,
 }
 
 impl HrtfApp {
@@ -106,6 +109,7 @@ impl Default for HrtfApp {
             apo_selected_endpoint: None,
             bypass_control: apo_install::BypassControl::open(),
             hrtf_enabled: true,
+            apo_pending: None,
         }
     }
 }
@@ -114,6 +118,29 @@ impl eframe::App for HrtfApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Check synthesis progress
         self.synth_state.poll();
+
+        // Check background APO operation
+        let mut apo_done = false;
+        if let Some(ref pending) = self.apo_pending {
+            if let Ok(mut guard) = pending.try_lock() {
+                if let Some(result) = guard.take() {
+                    match result {
+                        Ok(msg) => {
+                            self.apo_export_message = Some((true, msg));
+                            self.apo_endpoints =
+                                apo_install::list_audio_endpoints().unwrap_or_default();
+                        }
+                        Err(msg) => {
+                            self.apo_export_message = Some((false, msg));
+                        }
+                    }
+                    apo_done = true;
+                }
+            }
+        }
+        if apo_done {
+            self.apo_pending = None;
+        }
 
         egui::CentralPanel::default().show(ctx, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
@@ -150,14 +177,29 @@ impl eframe::App for HrtfApp {
             });
         });
 
-        // Keep repainting during synthesis
-        if self.synth_state.is_running() {
+        // Keep repainting during synthesis or pending APO op
+        if self.synth_state.is_running() || self.apo_pending.is_some() {
             ctx.request_repaint();
         }
     }
 }
 
 impl HrtfApp {
+    /// Spawn a background APO operation so the GUI thread isn't blocked.
+    fn spawn_apo_op<F>(&mut self, op: F)
+    where
+        F: FnOnce() -> Result<String, String> + Send + 'static,
+    {
+        let result = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let result_clone = result.clone();
+        std::thread::spawn(move || {
+            let r = op();
+            *result_clone.lock().unwrap() = Some(r);
+        });
+        self.apo_pending = Some(result);
+        self.apo_export_message = Some((true, "Working... (approve UAC if prompted)".into()));
+    }
+
     fn show_model_section(&mut self, ui: &mut egui::Ui) {
         egui::CollapsingHeader::new("Model File")
             .default_open(self.model_error.is_some())
@@ -330,71 +372,59 @@ impl HrtfApp {
     }
 
     fn show_setup_guide(&self, ui: &mut egui::Ui) {
-        egui::CollapsingHeader::new("HeSuVi Setup Guide")
+        egui::CollapsingHeader::new("Setup Guide")
             .default_open(false)
             .show(ui, |ui| {
-                ui.label("To use your personalized HRTF with games:");
+                ui.label("To use personalized HRTF with games:");
                 ui.add_space(4.0);
-                ui.label("1. Install EqualizerAPO (equalizer-apo.sourceforge.net)");
-                ui.label("2. Install HeSuVi (sourceforge.net/projects/hesuvi/)");
-                ui.label("3. Copy the generated .wav file to:");
-                ui.label("   C:\\Program Files\\EqualizerAPO\\config\\HeSuVi\\hrir\\");
-                ui.label("4. Open HeSuVi and select your file from the HRIR dropdown");
-                ui.label("5. Enable virtualization — all game audio will now use your personalized HRTF");
+                ui.label("1. Click 'Install APO' and approve the admin prompt");
+                ui.label("2. Select your headphone output device");
+                ui.label("3. Enter your ear measurements and click 'Export HRTF & Apply'");
+                ui.label("4. Set your game audio to 7.1 surround output");
+                ui.label("5. All game audio will now be spatialized through your personalized HRTF");
                 ui.add_space(4.0);
-                ui.label("Tip: Set your game audio output to 7.1 surround for best results.");
+                ui.label("The APO processes audio at the driver level with ~1ms latency.");
+                ui.label("Use the HRTF ON/OFF toggle to compare with and without processing.");
             });
     }
 
     fn show_apo_export(&mut self, ui: &mut egui::Ui) {
-        egui::CollapsingHeader::new("HRTF APO (Direct Audio Driver)")
-            .default_open(false)
+        egui::CollapsingHeader::new("HRTF APO (System Audio Driver)")
+            .default_open(true)
             .show(ui, |ui| {
                 let apo_installed = apo_install::is_apo_installed();
                 let ir_exists = apo_install::ir_file_exists();
+                let busy = self.apo_pending.is_some();
 
-                // ── Step 1: Install APO ──
-                let dll_needs_update = apo_installed && apo_install::dll_needs_update();
+                // ── Step 1: Install / Update APO ──
+                ui.label("Step 1: Install the APO driver");
+                ui.add_space(2.0);
 
                 if !apo_installed {
-                    ui.label("Step 1: Install the APO driver");
-                    ui.add_space(4.0);
-
-                    if ui.button("Install APO").clicked() {
-                        match apo_install::register_apo() {
-                            Ok(()) => {
-                                self.apo_export_message =
-                                    Some((true, "APO installed. Now select an audio endpoint below.".into()));
-                                self.apo_endpoints = apo_install::list_audio_endpoints().unwrap_or_default();
-                            }
-                            Err(e) => {
-                                self.apo_export_message = Some((false, format!("Install failed: {e}")));
-                            }
-                        }
-                    }
-
-                    ui.add_space(8.0);
-                } else if dll_needs_update {
-                    ui.colored_label(egui::Color32::from_rgb(255, 200, 100), "APO installed (update available)");
-                    if ui.button("Update APO DLL").clicked() {
-                        match apo_install::register_apo() {
-                            Ok(()) => {
-                                self.apo_export_message =
-                                    Some((true, "APO updated. Click 'Export HRTF & Apply' to restart audio.".into()));
-                            }
-                            Err(e) => {
-                                self.apo_export_message = Some((false, format!("Update failed: {e}")));
-                            }
-                        }
+                    if ui.add_enabled(!busy, egui::Button::new("Install APO (requires admin)")).clicked() {
+                        self.spawn_apo_op(|| {
+                            apo_install::register_apo()
+                                .map(|()| "APO installed. Select your audio device below.".into())
+                        });
                     }
                 } else {
-                    ui.colored_label(egui::Color32::from_rgb(100, 200, 100), "APO is installed (up to date).");
-                }
+                    let dll_needs_update = apo_install::dll_needs_update();
+                    if dll_needs_update {
+                        ui.horizontal(|ui| {
+                            ui.colored_label(egui::Color32::from_rgb(255, 200, 100), "APO installed (update available)");
+                            if ui.add_enabled(!busy, egui::Button::new("Update")).clicked() {
+                                self.spawn_apo_op(|| {
+                                    apo_install::register_apo()
+                                        .map(|()| "APO updated. Export HRTF & Apply to activate.".into())
+                                });
+                            }
+                        });
+                    } else {
+                        ui.colored_label(egui::Color32::from_rgb(100, 200, 100), "APO is installed.");
+                    }
 
-                // ── HRTF on/off toggle ──
-                if apo_installed {
+                    // ── HRTF on/off toggle ──
                     ui.add_space(4.0);
-                    // Sync state from shared memory on first read
                     if let Some(ref ctrl) = self.bypass_control {
                         self.hrtf_enabled = !ctrl.is_bypassed();
                     }
@@ -408,41 +438,45 @@ impl HrtfApp {
                     }
                 }
 
-                // ── Step 2: Associate with endpoint ──
-                if apo_installed || self.apo_export_message.as_ref().map_or(false, |m| m.0) {
-                    ui.add_space(4.0);
-                    ui.label("Step 2: Select audio endpoint (your headphones)");
+                // ── Step 2: Select endpoint + associate ──
+                ui.add_space(8.0);
+                ui.label("Step 2: Select audio endpoint (your headphones)");
+                ui.add_space(2.0);
 
-                    if self.apo_endpoints.is_empty() {
-                        if ui.button("Refresh audio devices").clicked() {
-                            self.apo_endpoints = apo_install::list_audio_endpoints().unwrap_or_default();
-                        }
+                if self.apo_endpoints.is_empty() {
+                    if ui.button("Refresh audio devices").clicked() {
+                        self.apo_endpoints = apo_install::list_audio_endpoints().unwrap_or_default();
                     }
+                } else if ui.button("Refresh").clicked() {
+                    self.apo_endpoints = apo_install::list_audio_endpoints().unwrap_or_default();
+                    self.apo_selected_endpoint = None;
+                }
 
-                    for (idx, name) in &self.apo_endpoints {
-                        let selected = self.apo_selected_endpoint == Some(*idx);
-                        if ui.selectable_label(selected, name).clicked() {
-                            self.apo_selected_endpoint = Some(*idx);
-                            match apo_install::associate_endpoint(*idx) {
-                                Ok(device_name) => {
-                                    self.apo_export_message = Some((
-                                        true,
-                                        format!("APO associated with: {device_name}"),
-                                    ));
-                                }
-                                Err(e) => {
-                                    self.apo_export_message = Some((false, format!("Associate failed: {e}")));
-                                }
-                            }
-                        }
+                let mut clicked_endpoint: Option<(usize, String, String)> = None;
+                for (i, (_idx, guid, name)) in self.apo_endpoints.iter().enumerate() {
+                    let selected = self.apo_selected_endpoint == Some(i);
+                    let display = format!("{name}  ({guid})");
+                    if ui.add_enabled(!busy, egui::SelectableLabel::new(selected, &display)).clicked()
+                        && apo_installed
+                    {
+                        clicked_endpoint = Some((i, guid.clone(), name.clone()));
                     }
+                }
+                if let Some((i, guid, name)) = clicked_endpoint {
+                    self.apo_selected_endpoint = Some(i);
+                    self.spawn_apo_op(move || {
+                        apo_install::associate_endpoint(&guid)
+                            .map(|()| format!("APO associated with: {name}"))
+                    });
                 }
 
                 // ── Step 3: Export HRTF & Apply ──
                 ui.add_space(8.0);
                 ui.label("Step 3: Export your personalized HRTF");
+                ui.add_space(2.0);
 
-                let can_export = self.model_error.is_none()
+                let can_export = !busy
+                    && self.model_error.is_none()
                     && self.model_path.exists()
                     && matches!(self.synth_state, SynthState::Idle | SynthState::Complete { .. });
 
@@ -464,8 +498,22 @@ impl HrtfApp {
                     );
                 }
 
+                // ── Uninstall ──
+                if apo_installed {
+                    ui.add_space(8.0);
+                    if ui.add_enabled(!busy, egui::Button::new("Uninstall APO")).clicked() {
+                        self.apo_endpoints.clear();
+                        self.apo_selected_endpoint = None;
+                        self.spawn_apo_op(|| {
+                            apo_install::uninstall_apo()
+                                .map(|()| "APO uninstalled. Original audio restored.".into())
+                        });
+                    }
+                }
+
                 // ── Status messages ──
                 if let Some((is_success, ref msg)) = self.apo_export_message {
+                    ui.add_space(4.0);
                     let color = if is_success {
                         egui::Color32::from_rgb(100, 255, 100)
                     } else {

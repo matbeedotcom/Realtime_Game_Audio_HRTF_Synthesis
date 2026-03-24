@@ -1,24 +1,20 @@
-//! APO installation and endpoint association — runs directly in the GUI process.
+//! APO installation and endpoint association.
 //!
-//! Handles COM/APO registry registration and endpoint property store writes
-//! so the user doesn't need a separate installer binary.
+//! All admin operations shell out to elevated processes via ShellExecuteW("runas")
+//! so the GUI itself doesn't need to run as administrator.
+
+use std::path::PathBuf;
 
 use windows::core::GUID;
+use windows::Win32::Foundation::*;
+use windows::Win32::System::Memory::*;
 use windows::Win32::System::Registry::*;
 
-/// Must match CLSID_HRTF_APO in hrtf-apo/src/lib.rs
+/// Must match CLSID_HrtfApo in hrtf-apo/cpp/guids.h
 const CLSID_HRTF_APO: GUID = GUID::from_u128(0xa1b2c3d4_e5f6_7890_abcd_ef0123456789);
 
-/// The APO DLL embedded at compile time. Built by: cargo build --release -p hrtf-apo
+/// The APO DLL embedded at compile time.
 const EMBEDDED_DLL: &[u8] = include_bytes!(env!("HRTF_APO_DLL_PATH"));
-const APO_FRIENDLY_NAME: &str = "Personalized HRTF Binaural";
-
-/// PKEY_FX_StreamEffectClsid = {D04E05A6-594B-4FB6-A80D-01AF5EED7D1D}, 5
-const PKEY_FX_STREAM_EFFECT_CLSID: windows::Win32::UI::Shell::PropertiesSystem::PROPERTYKEY =
-    windows::Win32::UI::Shell::PropertiesSystem::PROPERTYKEY {
-        fmtid: GUID::from_u128(0xD04E05A6_594B_4FB6_A80D_01AF5EED7D1D),
-        pid: 5,
-    };
 
 fn guid_to_string(guid: &GUID) -> String {
     format!(
@@ -28,6 +24,67 @@ fn guid_to_string(guid: &GUID) -> String {
         guid.data4[4], guid.data4[5], guid.data4[6], guid.data4[7],
     )
 }
+
+fn program_data_dir() -> PathBuf {
+    let pd = std::env::var("ProgramData").unwrap_or_else(|_| r"C:\ProgramData".into());
+    PathBuf::from(pd).join("HrtfApo")
+}
+
+fn system32_dll_path() -> PathBuf {
+    let win = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\WINDOWS".into());
+    PathBuf::from(win).join("System32").join("hrtf_apo.dll")
+}
+
+// ── Elevated process helpers ─────────────────────────────────────────────
+
+/// Run a command elevated and wait for it to complete.
+/// Uses ShellExecuteExW so we get a process handle to wait on.
+fn run_elevated_wait(exe: &str, args: &str) -> Result<(), String> {
+    use windows::Win32::UI::Shell::*;
+    use windows::Win32::System::Threading::*;
+    use windows::core::PCWSTR;
+
+    let exe_w: Vec<u16> = exe.encode_utf16().chain(std::iter::once(0)).collect();
+    let args_w: Vec<u16> = args.encode_utf16().chain(std::iter::once(0)).collect();
+    let verb_w: Vec<u16> = "runas".encode_utf16().chain(std::iter::once(0)).collect();
+
+    let mut sei = SHELLEXECUTEINFOW {
+        cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
+        fMask: SEE_MASK_NOCLOSEPROCESS,
+        hwnd: HWND::default(),
+        lpVerb: PCWSTR(verb_w.as_ptr()),
+        lpFile: PCWSTR(exe_w.as_ptr()),
+        lpParameters: PCWSTR(args_w.as_ptr()),
+        lpDirectory: PCWSTR::null(),
+        nShow: windows::Win32::UI::WindowsAndMessaging::SW_HIDE.0 as i32,
+        hInstApp: windows::Win32::Foundation::HINSTANCE::default(),
+        lpIDList: std::ptr::null_mut(),
+        lpClass: PCWSTR::null(),
+        hkeyClass: HKEY::default(),
+        dwHotKey: 0,
+        Anonymous: Default::default(),
+        hProcess: HANDLE::default(),
+    };
+
+    unsafe { ShellExecuteExW(&mut sei) }
+        .map_err(|e| format!("UAC denied or executable not found: {e}"))?;
+
+    if !sei.hProcess.is_invalid() {
+        unsafe {
+            WaitForSingleObject(sei.hProcess, 60000); // 60s timeout
+            let mut exit_code: u32 = 0;
+            let _ = GetExitCodeProcess(sei.hProcess, &mut exit_code);
+            CloseHandle(sei.hProcess).ok();
+            if exit_code != 0 {
+                return Err(format!("Process exited with code {exit_code}"));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+// ── Public API ───────────────────────────────────────────────────────────
 
 /// Check if the APO is registered in the Windows registry.
 pub fn is_apo_installed() -> bool {
@@ -41,67 +98,50 @@ pub fn dll_needs_update() -> bool {
     if EMBEDDED_DLL.is_empty() {
         return false;
     }
-    let program_data = std::env::var("ProgramData").unwrap_or_else(|_| r"C:\ProgramData".into());
-    let dll_path = std::path::Path::new(&program_data).join("HrtfApo").join("hrtf_apo.dll");
+    let dll_path = system32_dll_path();
     match std::fs::read(&dll_path) {
         Ok(installed) => installed != EMBEDDED_DLL,
-        Err(_) => true, // DLL missing — needs install
+        Err(_) => true,
     }
 }
 
 /// Check if the IR file exists in ProgramData.
 pub fn ir_file_exists() -> bool {
-    let program_data = std::env::var("ProgramData").unwrap_or_else(|_| r"C:\ProgramData".into());
-    std::path::Path::new(&program_data)
-        .join("HrtfApo")
-        .join("hrtf_irs.bin")
-        .exists()
+    program_data_dir().join("hrtf_irs.bin").exists()
 }
 
-/// Install the APO: extract embedded DLL to ProgramData, register COM class and APO.
+/// Install the APO (single UAC prompt):
+/// 1. Extract DLL to ProgramData (non-elevated)
+/// 2. Elevated: copy to System32, regsvr32, set DisableProtectedAudioDG
 pub fn register_apo() -> Result<(), String> {
     if EMBEDDED_DLL.is_empty() {
         return Err("APO DLL not embedded. Build hrtf-apo first, then rebuild GUI.".into());
     }
 
-    // 1. Extract DLL to ProgramData\HrtfApo\hrtf_apo.dll
-    let program_data = std::env::var("ProgramData").unwrap_or_else(|_| r"C:\ProgramData".into());
-    let install_dir = std::path::Path::new(&program_data).join("HrtfApo");
+    // 1. Write DLL to ProgramData (non-elevated — any user can write here)
+    let install_dir = program_data_dir();
     std::fs::create_dir_all(&install_dir)
-        .map_err(|e| format!("Failed to create install directory: {e}"))?;
+        .map_err(|e| format!("Failed to create {}: {e}", install_dir.display()))?;
 
-    let dll_path = install_dir.join("hrtf_apo.dll");
-    std::fs::write(&dll_path, EMBEDDED_DLL)
-        .map_err(|e| format!("Failed to write DLL: {e}"))?;
+    let pd_dll = install_dir.join("hrtf_apo.dll");
+    std::fs::write(&pd_dll, EMBEDDED_DLL)
+        .map_err(|e| format!("Failed to write DLL to ProgramData: {e}"))?;
 
-    let dll_str = dll_path.to_string_lossy();
-    let clsid_str = guid_to_string(&CLSID_HRTF_APO);
-
-    // 2. COM class registration
-    let com_key = format!(r"SOFTWARE\Classes\CLSID\{clsid_str}\InProcServer32");
-    reg_set_string(HKEY_LOCAL_MACHINE, &com_key, "", &dll_str)?;
-    reg_set_string(HKEY_LOCAL_MACHINE, &com_key, "ThreadingModel", "Both")?;
-
-    // 3. APO registration
-    let apo_key = format!(
-        r"SOFTWARE\Microsoft\Windows\CurrentVersion\Audio\AudioProcessingObjects\{clsid_str}"
+    // 2. Single elevated cmd: stop audio services (unlock DLL) + copy + regsvr32 + reg add + restart
+    let sys32_dll = system32_dll_path();
+    let batch = format!(
+        r#"/c net stop audiosrv /y & net stop AudioEndpointBuilder /y & timeout /t 1 /nobreak >nul & copy /Y "{pd}" "{s32}" && regsvr32 /s "{s32}" && reg add "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Audio" /v DisableProtectedAudioDG /t REG_DWORD /d 1 /f && net start AudioEndpointBuilder && net start audiosrv"#,
+        pd = pd_dll.display(),
+        s32 = sys32_dll.display(),
     );
-    reg_set_string(HKEY_LOCAL_MACHINE, &apo_key, "FriendlyName", APO_FRIENDLY_NAME)?;
-    reg_set_dword(HKEY_LOCAL_MACHINE, &apo_key, "MajorVersion", 1)?;
-    reg_set_dword(HKEY_LOCAL_MACHINE, &apo_key, "MinorVersion", 0)?;
-    // FRAMESPERSECOND_MUST_MATCH | BITSPERSAMPLE_MUST_MATCH = 0x0C
-    reg_set_dword(HKEY_LOCAL_MACHINE, &apo_key, "Flags", 0x0000000C)?;
-    reg_set_dword(HKEY_LOCAL_MACHINE, &apo_key, "MinInputConnections", 1)?;
-    reg_set_dword(HKEY_LOCAL_MACHINE, &apo_key, "MaxInputConnections", 1)?;
-    reg_set_dword(HKEY_LOCAL_MACHINE, &apo_key, "MinOutputConnections", 1)?;
-    reg_set_dword(HKEY_LOCAL_MACHINE, &apo_key, "MaxOutputConnections", 1)?;
-    reg_set_dword(HKEY_LOCAL_MACHINE, &apo_key, "MaxInstances", 0xFFFFFFFF)?;
+    run_elevated_wait("cmd.exe", &batch)
+        .map_err(|e| format!("Install failed: {e}"))?;
 
     Ok(())
 }
 
-/// List active audio render endpoints. Returns vec of (index, friendly_name).
-pub fn list_audio_endpoints() -> Result<Vec<(u32, String)>, String> {
+/// List active audio render endpoints. Returns vec of (index, endpoint_guid, friendly_name).
+pub fn list_audio_endpoints() -> Result<Vec<(u32, String, String)>, String> {
     use windows::Win32::Devices::FunctionDiscovery::PKEY_Device_FriendlyName;
     use windows::Win32::Media::Audio::*;
     use windows::Win32::System::Com::*;
@@ -109,18 +149,32 @@ pub fn list_audio_endpoints() -> Result<Vec<(u32, String)>, String> {
     unsafe {
         let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
 
-        let enumerator: IMMDeviceEnumerator = CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)
-            .map_err(|e| format!("Failed to create device enumerator: {e}"))?;
+        let enumerator: IMMDeviceEnumerator =
+            CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)
+                .map_err(|e| format!("Failed to create device enumerator: {e}"))?;
 
         let collection = enumerator
             .EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE)
             .map_err(|e| format!("Failed to enumerate endpoints: {e}"))?;
 
-        let count = collection.GetCount().map_err(|e| format!("GetCount failed: {e}"))?;
+        let count = collection
+            .GetCount()
+            .map_err(|e| format!("GetCount failed: {e}"))?;
 
         let mut result = Vec::new();
         for i in 0..count {
             let device = collection.Item(i).map_err(|e| format!("Item failed: {e}"))?;
+
+            // Get device ID — looks like: {0.0.0.00000000}.{GUID}
+            let id = device.GetId().map_err(|e| format!("GetId failed: {e}"))?;
+            let id_str = id.to_string().map_err(|_| "Failed to read device ID".to_string())?;
+            let endpoint_guid = id_str
+                .rsplit('.')
+                .next()
+                .unwrap_or(&id_str)
+                .to_string();
+
+            // Get friendly name
             let props = device
                 .OpenPropertyStore(STGM(0))
                 .map_err(|e| format!("OpenPropertyStore failed: {e}"))?;
@@ -128,174 +182,86 @@ pub fn list_audio_endpoints() -> Result<Vec<(u32, String)>, String> {
                 .GetValue(&PKEY_Device_FriendlyName)
                 .map_err(|e| format!("GetValue failed: {e}"))?;
             let name = format!("{}", name_pv).trim_matches('"').to_string();
-            result.push((i, name));
+
+            result.push((i, endpoint_guid, name));
         }
 
         Ok(result)
     }
 }
 
-/// Associate the APO with the audio endpoint at the given index.
-/// Writes the SFX CLSID directly to the endpoint's FxProperties registry key.
-pub fn associate_endpoint(index: u32) -> Result<String, String> {
-    use windows::Win32::Devices::FunctionDiscovery::PKEY_Device_FriendlyName;
-    use windows::Win32::Media::Audio::*;
-    use windows::Win32::System::Com::*;
-
-    unsafe {
-        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
-
-        let enumerator: IMMDeviceEnumerator = CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)
-            .map_err(|e| format!("Failed to create device enumerator: {e}"))?;
-
-        let collection = enumerator
-            .EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE)
-            .map_err(|e| format!("Failed to enumerate endpoints: {e}"))?;
-
-        let device = collection.Item(index).map_err(|e| format!("Item failed: {e}"))?;
-
-        // Get device ID to find its registry path
-        let id = device.GetId().map_err(|e| format!("GetId failed: {e}"))?;
-        let id_str = id.to_string().map_err(|_| "Failed to read device ID".to_string())?;
-
-        // Get friendly name
-        let props = device.OpenPropertyStore(STGM(0)).map_err(|e| format!("{e}"))?;
-        let name_pv = props
-            .GetValue(&PKEY_Device_FriendlyName)
-            .map_err(|e| format!("{e}"))?;
-        let name = format!("{}", name_pv).trim_matches('"').to_string();
-
-        // Find the endpoint GUID in the registry — search active render endpoints
-        // The device ID looks like: {0.0.0.00000000}.{GUID}
-        // The registry key is: HKLM\...\MMDevices\Audio\Render\{GUID}\FxProperties
-        let endpoint_guid = id_str.rsplit('.').next()
-            .ok_or("Could not parse endpoint GUID from device ID")?;
-
-        let fx_key = format!(
-            r"SOFTWARE\Microsoft\Windows\CurrentVersion\MMDevices\Audio\Render\{endpoint_guid}\FxProperties"
-        );
-
-        let clsid_str = guid_to_string(&CLSID_HRTF_APO);
-
-        // Legacy: PKEY_FX_StreamEffectClsid = {d04e05a6-594b-4fb6-a80d-01af5eed7d1d},5 (REG_SZ)
-        reg_set_string(
-            HKEY_LOCAL_MACHINE, &fx_key,
-            "{d04e05a6-594b-4fb6-a80d-01af5eed7d1d},5",
-            &clsid_str,
-        )?;
-
-        // Windows 10 1903+: PKEY_CompositeFX_StreamEffectClsid = {d3993a3f-99c2-4402-b5ec-a92a0367664b},5
-        // Must be REG_MULTI_SZ (array of GUID strings)
-        reg_set_multi_string(
-            HKEY_LOCAL_MACHINE, &fx_key,
-            "{d3993a3f-99c2-4402-b5ec-a92a0367664b},5",
-            &[&clsid_str],
-        )?;
-
-        Ok(name)
+/// Associate the APO with a specific endpoint by GUID (single UAC prompt).
+/// Runs InstallForEndpoint, restarts audio services, re-applies SFX in one elevated cmd.
+pub fn associate_endpoint(endpoint_guid: &str) -> Result<(), String> {
+    let sys32_dll = system32_dll_path();
+    if !sys32_dll.exists() {
+        return Err("APO DLL not found in System32. Run Install first.".into());
     }
-}
 
-// ── Registry helpers ────────────────────────────────────────────────────
+    // Single elevated cmd: InstallForEndpoint + restart services + re-apply
+    let batch = format!(
+        r#"/c rundll32 "{dll}",InstallForEndpoint {guid} && net stop audiosrv /y && net stop AudioEndpointBuilder /y && timeout /t 1 /nobreak >nul && net start AudioEndpointBuilder && net start audiosrv && timeout /t 2 /nobreak >nul && rundll32 "{dll}",InstallForEndpoint {guid}"#,
+        dll = sys32_dll.display(),
+        guid = endpoint_guid,
+    );
+    run_elevated_wait("cmd.exe", &batch)
+        .map_err(|e| format!("Associate failed: {e}"))?;
 
-fn reg_set_string(root: HKEY, subkey: &str, name: &str, value: &str) -> Result<(), String> {
-    unsafe {
-        let mut hkey = HKEY::default();
-        let subkey_w: Vec<u16> = subkey.encode_utf16().chain(std::iter::once(0)).collect();
-
-        let result = RegCreateKeyW(root, windows::core::PCWSTR(subkey_w.as_ptr()), &mut hkey);
-        if result.is_err() {
-            return Err(format!("Failed to create registry key: {subkey} (run as admin)"));
-        }
-
-        let name_w: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
-        let value_w: Vec<u16> = value.encode_utf16().chain(std::iter::once(0)).collect();
-        let value_bytes: &[u8] =
-            std::slice::from_raw_parts(value_w.as_ptr() as *const u8, value_w.len() * 2);
-
-        let result = RegSetValueExW(
-            hkey,
-            windows::core::PCWSTR(name_w.as_ptr()),
-            0,
-            REG_SZ,
-            Some(value_bytes),
-        );
-        let _ = RegCloseKey(hkey);
-
-        if result.is_err() {
-            return Err(format!("Failed to set registry value: {name}"));
-        }
-    }
     Ok(())
 }
 
-fn reg_set_multi_string(root: HKEY, subkey: &str, name: &str, values: &[&str]) -> Result<(), String> {
-    unsafe {
-        let mut hkey = HKEY::default();
-        let subkey_w: Vec<u16> = subkey.encode_utf16().chain(std::iter::once(0)).collect();
+/// Uninstall the APO (single UAC prompt):
+/// Unregisters COM, restores original SFX, deletes DLL, restarts services.
+pub fn uninstall_apo() -> Result<(), String> {
+    let sys32_dll = system32_dll_path();
+    let pd = program_data_dir();
 
-        let result = RegCreateKeyW(root, windows::core::PCWSTR(subkey_w.as_ptr()), &mut hkey);
-        if result.is_err() {
-            return Err(format!("Failed to create registry key: {subkey} (run as admin)"));
-        }
+    // Build the elevated batch command
+    let mut cmds: Vec<String> = Vec::new();
 
-        let name_w: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+    // Unregister
+    if sys32_dll.exists() {
+        cmds.push(format!(r#"regsvr32 /u /s "{}""#, sys32_dll.display()));
+    }
 
-        // REG_MULTI_SZ: each string null-terminated, then double-null at the end
-        let mut data: Vec<u16> = Vec::new();
-        for v in values {
-            data.extend(v.encode_utf16());
-            data.push(0); // null terminator for this string
-        }
-        data.push(0); // final double-null
-
-        let data_bytes: &[u8] =
-            std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 2);
-
-        let result = RegSetValueExW(
-            hkey,
-            windows::core::PCWSTR(name_w.as_ptr()),
-            0,
-            REG_MULTI_SZ,
-            Some(data_bytes),
-        );
-        let _ = RegCloseKey(hkey);
-
-        if result.is_err() {
-            return Err(format!("Failed to set registry value: {name}"));
+    // Restore original SFX CLSID if saved
+    let original_sfx_path = pd.join("original_sfx.txt");
+    if original_sfx_path.exists() {
+        if let Ok(contents) = std::fs::read_to_string(&original_sfx_path) {
+            let mut lines = contents.lines();
+            if let (Some(endpoint_guid), Some(original_clsid)) = (lines.next(), lines.next()) {
+                cmds.push(format!(
+                    r#"reg add "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\MMDevices\Audio\Render\{}\FxProperties" /v "{{d04e05a6-594b-4fb6-a80d-01af5eed7d1d}},5" /t REG_SZ /d "{}" /f"#,
+                    endpoint_guid.trim(),
+                    original_clsid.trim()
+                ));
+            }
         }
     }
+
+    // Delete DLL from System32
+    if sys32_dll.exists() {
+        cmds.push(format!(r#"del /F "{}""#, sys32_dll.display()));
+    }
+
+    // Remove DisableProtectedAudioDG
+    cmds.push(r#"reg delete "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Audio" /v DisableProtectedAudioDG /f"#.into());
+
+    // Restart audio services
+    cmds.push("net stop audiosrv /y & net stop AudioEndpointBuilder /y & timeout /t 1 /nobreak >nul & net start AudioEndpointBuilder & net start audiosrv".into());
+
+    let batch = format!("/c {}", cmds.join(" & "));
+    run_elevated_wait("cmd.exe", &batch)
+        .map_err(|e| format!("Uninstall failed: {e}"))?;
+
+    // Delete ProgramData files (non-elevated)
+    let _ = std::fs::remove_file(pd.join("hrtf_apo.dll"));
+    let _ = std::fs::remove_file(pd.join("original_sfx.txt"));
+
     Ok(())
 }
 
-fn reg_set_dword(root: HKEY, subkey: &str, name: &str, value: u32) -> Result<(), String> {
-    unsafe {
-        let mut hkey = HKEY::default();
-        let subkey_w: Vec<u16> = subkey.encode_utf16().chain(std::iter::once(0)).collect();
-
-        let result = RegCreateKeyW(root, windows::core::PCWSTR(subkey_w.as_ptr()), &mut hkey);
-        if result.is_err() {
-            return Err(format!("Failed to create registry key: {subkey}"));
-        }
-
-        let name_w: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
-        let value_bytes = value.to_le_bytes();
-
-        let result = RegSetValueExW(
-            hkey,
-            windows::core::PCWSTR(name_w.as_ptr()),
-            0,
-            REG_DWORD,
-            Some(&value_bytes),
-        );
-        let _ = RegCloseKey(hkey);
-
-        if result.is_err() {
-            return Err(format!("Failed to set registry value: {name}"));
-        }
-    }
-    Ok(())
-}
+// ── Registry read helper (non-elevated, read-only) ───────────────────────
 
 fn reg_get_string(root: HKEY, subkey: &str, name: &str) -> Result<String, String> {
     unsafe {
@@ -348,10 +314,7 @@ fn reg_get_string(root: HKEY, subkey: &str, name: &str) -> Result<String, String
     }
 }
 
-// ── Bypass flag (shared memory with the APO) ────────────────────────────
-
-use windows::Win32::Foundation::*;
-use windows::Win32::System::Memory::*;
+// ── Bypass flag (shared memory with the APO) ─────────────────────────────
 
 const SHARED_MEM_NAME: &str = "Global\\HrtfApoBypass";
 
@@ -368,7 +331,10 @@ impl BypassControl {
     /// Open or create the shared memory for the bypass flag.
     pub fn open() -> Option<Self> {
         unsafe {
-            let name_w: Vec<u16> = SHARED_MEM_NAME.encode_utf16().chain(std::iter::once(0)).collect();
+            let name_w: Vec<u16> = SHARED_MEM_NAME
+                .encode_utf16()
+                .chain(std::iter::once(0))
+                .collect();
 
             let handle = CreateFileMappingW(
                 INVALID_HANDLE_VALUE,
@@ -377,7 +343,8 @@ impl BypassControl {
                 0,
                 4,
                 windows::core::PCWSTR(name_w.as_ptr()),
-            ).ok()?;
+            )
+            .ok()?;
 
             let ptr = MapViewOfFile(handle, FILE_MAP_ALL_ACCESS, 0, 0, 4);
             if ptr.Value.is_null() {
@@ -404,7 +371,9 @@ impl BypassControl {
 impl Drop for BypassControl {
     fn drop(&mut self) {
         unsafe {
-            let _ = UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: self.ptr as *mut _ });
+            let _ = UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
+                Value: self.ptr as *mut _,
+            });
             let _ = CloseHandle(self._handle);
         }
     }

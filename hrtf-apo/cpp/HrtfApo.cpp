@@ -4,6 +4,7 @@
 #include <audioengineextensionapo.h>
 #include <cstdio>
 #include <cstring>
+#include <cmath>
 
 static void DebugLog(const char* msg)
 {
@@ -49,7 +50,15 @@ HrtfApo::HrtfApo(IUnknown* pUnkOuter)
     rustConvolver = nullptr;
     inputChannels = 0;
     outputChannels = 0;
+    sampleRate = 48000.0f;
     firstProcess = true;
+
+    bypassMapping = NULL;
+    bypassPtr = nullptr;
+    lastBypassState = false;
+    cueSamplesRemaining = 0;
+    cueFrequency = 0.0f;
+    cuePhase = 0.0f;
 
     InterlockedIncrement(&instCount);
     DebugLog("HrtfApo constructed");
@@ -62,7 +71,62 @@ HrtfApo::~HrtfApo()
         hrtf_convolver_destroy(rustConvolver);
         rustConvolver = nullptr;
     }
+    if (bypassPtr) UnmapViewOfFile((LPVOID)bypassPtr);
+    if (bypassMapping) CloseHandle(bypassMapping);
     DebugLog("HrtfApo destroyed");
+}
+
+void HrtfApo::OpenBypassSharedMemory()
+{
+    // Try opening first (GUI may have created it already)
+    bypassMapping = OpenFileMappingW(FILE_MAP_READ, FALSE, L"Global\\HrtfApoBypass");
+    if (!bypassMapping) {
+        // Create with NULL DACL so both user GUI and SYSTEM audiodg.exe can access
+        SECURITY_DESCRIPTOR sd;
+        InitializeSecurityDescriptor(&sd, SECURITY_DESCRIPTOR_REVISION);
+        SetSecurityDescriptorDacl(&sd, TRUE, NULL, FALSE);
+        SECURITY_ATTRIBUTES sa = { sizeof(SECURITY_ATTRIBUTES), &sd, FALSE };
+        bypassMapping = CreateFileMappingW(INVALID_HANDLE_VALUE, &sa, PAGE_READWRITE, 0, 4, L"Global\\HrtfApoBypass");
+    }
+    if (bypassMapping) {
+        bypassPtr = (volatile BYTE*)MapViewOfFile(bypassMapping, FILE_MAP_READ, 0, 0, 4);
+        DebugLog(bypassPtr ? "Bypass shared memory opened" : "Bypass MapViewOfFile failed");
+    } else {
+        char buf[64]; snprintf(buf, sizeof(buf), "Bypass shared memory failed: %lu", GetLastError());
+        DebugLog(buf);
+    }
+}
+
+bool HrtfApo::IsBypassed()
+{
+    if (bypassPtr) return *bypassPtr != 0;
+    return false;
+}
+
+void HrtfApo::MixCueTone(float* output, UINT32 nFrames, UINT32 channels)
+{
+    if (cueSamplesRemaining == 0) return;
+
+    const float amplitude = 0.15f;
+    const float twoPi = 6.2831853f;
+
+    UINT32 samplesToMix = (nFrames < cueSamplesRemaining) ? nFrames : cueSamplesRemaining;
+    for (UINT32 f = 0; f < samplesToMix; f++) {
+        float t = cuePhase / sampleRate;
+        float sample = amplitude * sinf(twoPi * cueFrequency * t);
+
+        // Fade out over last 25% to avoid click
+        float remaining = (float)cueSamplesRemaining / (sampleRate * 0.12f);
+        if (remaining < 0.25f) sample *= remaining * 4.0f;
+
+        // Mix into L+R (channels 0 and 1)
+        output[f * channels + 0] += sample;
+        if (channels > 1)
+            output[f * channels + 1] += sample;
+
+        cuePhase += 1.0f;
+        cueSamplesRemaining--;
+    }
 }
 
 // ── IUnknown (delegating) ───────────────────────────────────────────────
@@ -164,10 +228,10 @@ HRESULT HrtfApo::Initialize(UINT32 cbDataSize, BYTE* pbyData)
 
     // Load IRs
     const wchar_t* irPath = L"C:\\ProgramData\\HrtfApo\\hrtf_irs.bin";
-    UINT32 irLength = 0, sampleRate = 0;
-    float* irs = hrtf_load_irs(irPath, &irLength, &sampleRate);
+    UINT32 irLength = 0, irSampleRate = 0;
+    float* irs = hrtf_load_irs(irPath, &irLength, &irSampleRate);
     if (irs) {
-        DebugLogf("IRs loaded: length=%u, sampleRate=%u", irLength, sampleRate);
+        DebugLogf("IRs loaded: length=%u, sampleRate=%u", irLength, irSampleRate);
         if (rustConvolver) hrtf_convolver_destroy(rustConvolver);
         rustConvolver = hrtf_convolver_create(irs, irLength);
         hrtf_free_irs(irs, 7 * 2 * irLength);
@@ -175,6 +239,9 @@ HRESULT HrtfApo::Initialize(UINT32 cbDataSize, BYTE* pbyData)
     } else {
         DebugLog("No IRs found — passthrough mode");
     }
+
+    // Open shared memory for bypass toggle
+    if (!bypassPtr) OpenBypassSharedMemory();
 
     return S_OK;
 }
@@ -238,7 +305,9 @@ HRESULT HrtfApo::LockForProcess(
         outputChannels = outFormat.dwSamplesPerFrame;
     }
 
-    DebugLogf("Channels: in=%u, out=%u, rate=%.0f", inputChannels, outputChannels, inFormat.fFramesPerSecond);
+    sampleRate = inFormat.fFramesPerSecond;
+    if (sampleRate < 1.0f) sampleRate = 48000.0f;
+    DebugLogf("Channels: in=%u, out=%u, rate=%.0f", inputChannels, outputChannels, sampleRate);
 
     HRESULT hr = CBaseAudioProcessingObject::LockForProcess(
         u32NumInputConnections, ppInputConnections,
@@ -270,11 +339,21 @@ void HrtfApo::APOProcess(
     float* outputFrames = reinterpret_cast<float*>(ppOutputConnections[0]->pBuffer);
     UINT32 nFrames = ppInputConnections[0]->u32ValidFrameCount;
 
+    // Check bypass toggle
+    bool bypassed = IsBypassed();
+    if (bypassed != lastBypassState) {
+        lastBypassState = bypassed;
+        // Trigger audio cue: rising tone = HRTF ON, falling tone = HRTF OFF
+        cueFrequency = bypassed ? 660.0f : 880.0f;  // OFF=lower, ON=higher
+        cueSamplesRemaining = (UINT32)(sampleRate * 0.12f); // 120ms tone
+        cuePhase = 0.0f;
+    }
+
     if (firstProcess) {
         firstProcess = false;
-        DebugLogf("APOProcess first: frames=%u, in=%u, out=%u, conv=%p, inplace=%d",
+        DebugLogf("APOProcess first: frames=%u, in=%u, out=%u, conv=%p, inplace=%d, bypass=%d",
                   nFrames, inputChannels, outputChannels, rustConvolver,
-                  (inputFrames == outputFrames) ? 1 : 0);
+                  (inputFrames == outputFrames) ? 1 : 0, bypassed ? 1 : 0);
     }
 
     switch (ppInputConnections[0]->u32BufferFlags)
@@ -284,7 +363,18 @@ void HrtfApo::APOProcess(
         if (ppInputConnections[0]->u32BufferFlags == BUFFER_SILENT)
             memset(inputFrames, 0, nFrames * inputChannels * sizeof(float));
 
-        if (inputFrames == outputFrames) {
+        if (bypassed) {
+            // Bypass: passthrough (copy if not in-place)
+            if (inputFrames != outputFrames) {
+                for (UINT32 f = 0; f < nFrames; f++) {
+                    UINT32 copyChans = (inputChannels < outputChannels) ? inputChannels : outputChannels;
+                    for (UINT32 c = 0; c < copyChans; c++)
+                        outputFrames[f * outputChannels + c] = inputFrames[f * inputChannels + c];
+                    for (UINT32 c = copyChans; c < outputChannels; c++)
+                        outputFrames[f * outputChannels + c] = 0.0f;
+                }
+            }
+        } else if (inputFrames == outputFrames) {
             // In-place: same buffer, same channel count
             if (inputChannels >= 8 && rustConvolver) {
                 hrtf_convolver_process_inplace(rustConvolver, inputFrames, nFrames, inputChannels);
@@ -308,9 +398,12 @@ void HrtfApo::APOProcess(
             }
         }
 
+        // Mix in audio cue tone on bypass state change
+        MixCueTone(outputFrames, nFrames, outputChannels);
+
         ppOutputConnections[0]->u32ValidFrameCount = nFrames;
 
-        if (ppInputConnections[0]->u32BufferFlags == BUFFER_SILENT)
+        if (ppInputConnections[0]->u32BufferFlags == BUFFER_SILENT && cueSamplesRemaining == 0)
             ppOutputConnections[0]->u32BufferFlags = BUFFER_SILENT;
         else
             ppOutputConnections[0]->u32BufferFlags = BUFFER_VALID;

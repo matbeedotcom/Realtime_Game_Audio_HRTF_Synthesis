@@ -329,8 +329,30 @@ unsafe impl Sync for BypassControl {}
 
 impl BypassControl {
     /// Open or create the shared memory for the bypass flag.
+    /// Uses a permissive DACL so audiodg.exe (SYSTEM) can also access it.
     pub fn open() -> Option<Self> {
         unsafe {
+            // SDDL: D:(A;;GA;;;WD) = grant Generic All to Everyone (World)
+            let sddl: Vec<u16> = "D:(A;;GA;;;WD)"
+                .encode_utf16()
+                .chain(std::iter::once(0))
+                .collect();
+            let mut sd_ptr: windows::Win32::Security::PSECURITY_DESCRIPTOR =
+                windows::Win32::Security::PSECURITY_DESCRIPTOR(std::ptr::null_mut());
+
+            let _ = windows::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                windows::core::PCWSTR(sddl.as_ptr()),
+                1, // SDDL_REVISION_1
+                &mut sd_ptr,
+                None,
+            );
+
+            let sa = windows::Win32::Security::SECURITY_ATTRIBUTES {
+                nLength: std::mem::size_of::<windows::Win32::Security::SECURITY_ATTRIBUTES>() as u32,
+                lpSecurityDescriptor: sd_ptr.0,
+                bInheritHandle: false.into(),
+            };
+
             let name_w: Vec<u16> = SHARED_MEM_NAME
                 .encode_utf16()
                 .chain(std::iter::once(0))
@@ -338,13 +360,22 @@ impl BypassControl {
 
             let handle = CreateFileMappingW(
                 INVALID_HANDLE_VALUE,
-                None,
+                Some(&sa),
                 PAGE_READWRITE,
                 0,
                 4,
                 windows::core::PCWSTR(name_w.as_ptr()),
             )
-            .ok()?;
+            .ok();
+
+            // Free the SDDL-allocated descriptor
+            if !sd_ptr.0.is_null() {
+                let _ = windows::Win32::Foundation::LocalFree(
+                    windows::Win32::Foundation::HLOCAL(sd_ptr.0),
+                );
+            }
+
+            let handle = handle?;
 
             let ptr = MapViewOfFile(handle, FILE_MAP_ALL_ACCESS, 0, 0, 4);
             if ptr.Value.is_null() {

@@ -69,5 +69,20 @@ private:
     void* rustConvolver;
     UINT32 inputChannels;
     UINT32 outputChannels;
+    float sampleRate;
     bool firstProcess;
+
+    // Bypass control via shared memory with GUI
+    HANDLE bypassMapping;
+    volatile BYTE* bypassPtr;
+    bool lastBypassState;
+
+    // Audio cue on bypass toggle: short sine tone
+    UINT32 cueSamplesRemaining;
+    float cueFrequency;
+    float cuePhase;
+
+    void OpenBypassSharedMemory();
+    bool IsBypassed();
+    void MixCueTone(float* output, UINT32 nFrames, UINT32 channels);
 };

@@ -1,0 +1,35 @@
+{
+  "permissions": {
+    "allow": [
+      "WebSearch",
+      "WebFetch(domain:sourceforge.net)",
+      "WebFetch(domain:microsoft.github.io)",
+      "Bash(cargo build:*)",
+      "Bash(cargo test:*)",
+      "Bash(find c:/Users/mail/dev/personal/Individualized_HRTF_Synthesis/hrtf-apo -name *.def -o -name *.toml)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "Bash(curl -s https://raw.githubusercontent.com/TheFireKahuna/equalizerAPO64/main/EqualizerAPO/EqualizerAPO.cpp)",
+      "Bash(curl -s https://raw.githubusercontent.com/TheFireKahuna/equalizerAPO64/main/EqualizerAPO/ClassFactory.h)",
+      "Read(//c/Program Files/**)",
+      "Read(//c/Program Files \\(x86\\)/**)",
+      "Bash(find 'C:\\\\Program Files \\(x86\\)\\\\Windows Kits\\\\10\\\\Lib' -name *.lib)",
+      "Bash(find 'C:\\\\Program Files \\(x86\\)\\\\Windows Kits\\\\10\\\\Include' -name *.h)",
+      "Bash(find 'C:\\\\Program Files \\(x86\\)\\\\Microsoft Visual Studio\\\\2022\\\\BuildTools\\\\VC\\\\Tools\\\\MSVC' -name atlbase.h)",
+      "Bash(powershell -Command \"Get-ChildItem ''HKLM:\\\\SOFTWARE\\\\Microsoft\\\\Windows\\\\CurrentVersion\\\\Audio\\\\AudioProcessingObjects'' | ForEach-Object { $props = Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue; Write-Host $_.PSChildName ''|'' $props.FriendlyName }\")",
+      "Bash(powershell -Command \"Get-ItemProperty ''HKLM:\\\\SOFTWARE\\\\Microsoft\\\\Windows\\\\CurrentVersion\\\\MMDevices\\\\Audio\\\\Render\\\\{f6654c7e-35f3-4d39-b531-3c0e94f98e55}\\\\FxProperties'' -ErrorAction SilentlyContinue | Select-Object -Property ''{d3993a3f-99c2-4402-b5ec-a92a0367664b},5'', ''{d3993a3f-99c2-4402-b5ec-a92a0367664b},6'', ''{d3993a3f-99c2-4402-b5ec-a92a0367664b},7''\")",
+      "Bash(curl -s https://sourceforge.net/p/equalizerapo/code/HEAD/tree/)",
+      "Bash(find /c/Users/mail/dev/personal/EqualizerAPO -type f \\\\\\(-name *.ps1 -o -name *.vbs -o -name *.bat \\\\\\))",
+      "Bash(grep -r \"RestartAudioEngine\\\\|AudioEndpointBuilder\\\\|system\\(\" /c/Users/mail/dev/personal/EqualizerAPO --include=*.cpp --include=*.h)",
+      "Bash(grep -rn \"renderKeyPath\\\\|captureKeyPath\\\\|childApoPath\" /c/Users/mail/dev/personal/EqualizerAPO/*.h)",
+      "Bash(powershell -Command \"Start-Process powershell -Verb RunAs -ArgumentList ''-ExecutionPolicy'',''Bypass'',''-File'',''C:\\\\Users\\\\mail\\\\dev\\\\personal\\\\Individualized_HRTF_Synthesis\\\\test_write.ps1'' -Wait\")",
+      "Read(//c/ProgramData/HrtfApo/**)",
+      "Bash(powershell -ExecutionPolicy Bypass -File c:/Users/mail/dev/personal/Individualized_HRTF_Synthesis/test_com.ps1)",
+      "Bash(powershell -Command \"Start-Process powershell -Verb RunAs -ArgumentList ''-ExecutionPolicy'',''Bypass'',''-File'',''C:\\\\Users\\\\mail\\\\dev\\\\personal\\\\Individualized_HRTF_Synthesis\\\\deploy_apo.ps1'',''-SkipBuild'' -Wait\")",
+      "Bash(powershell -ExecutionPolicy Bypass -Command \"\\(Get-ItemProperty ''HKLM:\\\\SOFTWARE\\\\Classes\\\\CLSID\\\\{A1B2C3D4-E5F6-7890-ABCD-EF0123456789}\\\\InProcServer32'' -ErrorAction SilentlyContinue\\).''\\(Default\\)''\")",
+      "Bash(powershell -ExecutionPolicy Bypass -Command \"Write-Host ''Legacy SFX:'' \\(Get-ItemProperty ''HKLM:\\\\SOFTWARE\\\\Microsoft\\\\Windows\\\\CurrentVersion\\\\MMDevices\\\\Audio\\\\Render\\\\{f6654c7e-35f3-4d39-b531-3c0e94f98e55}\\\\FxProperties''\\).''{d04e05a6-594b-4fb6-a80d-01af5eed7d1d},5''; Write-Host ''Composite:'' \\(\\(Get-ItemProperty ''HKLM:\\\\SOFTWARE\\\\Microsoft\\\\Windows\\\\CurrentVersion\\\\MMDevices\\\\Audio\\\\Render\\\\{f6654c7e-35f3-4d39-b531-3c0e94f98e55}\\\\FxProperties''\\).''{d3993a3f-99c2-4402-b5ec-a92a0367664b},5'' -join '', ''\\)\")",
+      "Bash(powershell -ExecutionPolicy Bypass -File \"c:/Users/mail/dev/personal/Individualized_HRTF_Synthesis/check_default.ps1\")",
+      "Bash(grep -r EQUALIZERAPO.*GUID c:/Users/mail/dev/personal/EqualizerAPO/EqualizerAPO)",
+      "Bash(xargs grep:*)"
+    ]
+  }
+}

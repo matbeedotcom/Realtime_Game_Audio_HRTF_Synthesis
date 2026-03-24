@@ -3,6 +3,7 @@
 //! Provides an egui-based interface for entering anthropometric measurements
 //! and generating personalized HeSuVi WAV files.
 
+mod apo_install;
 mod synthesis;
 
 use std::path::PathBuf;
@@ -42,6 +43,17 @@ pub struct HrtfApp {
 
     // Validation errors
     validation_errors: Vec<String>,
+
+    // APO export status
+    apo_export_message: Option<(bool, String)>, // (is_success, message)
+
+    // APO endpoint picker
+    apo_endpoints: Vec<(u32, String)>,
+    apo_selected_endpoint: Option<u32>,
+
+    // APO bypass control (shared memory toggle)
+    bypass_control: Option<apo_install::BypassControl>,
+    hrtf_enabled: bool,
 }
 
 impl HrtfApp {
@@ -89,6 +101,11 @@ impl Default for HrtfApp {
             model_path: PathBuf::new(),
             model_error: None,
             validation_errors: Vec::new(),
+            apo_export_message: None,
+            apo_endpoints: Vec::new(),
+            apo_selected_endpoint: None,
+            bypass_control: apo_install::BypassControl::open(),
+            hrtf_enabled: true,
         }
     }
 }
@@ -122,6 +139,10 @@ impl eframe::App for HrtfApp {
 
                 // Synthesize button + progress
                 self.show_synth_section(ui);
+                ui.add_space(8.0);
+
+                // APO export
+                self.show_apo_export(ui);
                 ui.add_space(8.0);
 
                 // Setup guide
@@ -325,6 +346,221 @@ impl HrtfApp {
             });
     }
 
+    fn show_apo_export(&mut self, ui: &mut egui::Ui) {
+        egui::CollapsingHeader::new("HRTF APO (Direct Audio Driver)")
+            .default_open(false)
+            .show(ui, |ui| {
+                let apo_installed = apo_install::is_apo_installed();
+                let ir_exists = apo_install::ir_file_exists();
+
+                // ── Step 1: Install APO ──
+                let dll_needs_update = apo_installed && apo_install::dll_needs_update();
+
+                if !apo_installed {
+                    ui.label("Step 1: Install the APO driver");
+                    ui.add_space(4.0);
+
+                    if ui.button("Install APO").clicked() {
+                        match apo_install::register_apo() {
+                            Ok(()) => {
+                                self.apo_export_message =
+                                    Some((true, "APO installed. Now select an audio endpoint below.".into()));
+                                self.apo_endpoints = apo_install::list_audio_endpoints().unwrap_or_default();
+                            }
+                            Err(e) => {
+                                self.apo_export_message = Some((false, format!("Install failed: {e}")));
+                            }
+                        }
+                    }
+
+                    ui.add_space(8.0);
+                } else if dll_needs_update {
+                    ui.colored_label(egui::Color32::from_rgb(255, 200, 100), "APO installed (update available)");
+                    if ui.button("Update APO DLL").clicked() {
+                        match apo_install::register_apo() {
+                            Ok(()) => {
+                                self.apo_export_message =
+                                    Some((true, "APO updated. Click 'Export HRTF & Apply' to restart audio.".into()));
+                            }
+                            Err(e) => {
+                                self.apo_export_message = Some((false, format!("Update failed: {e}")));
+                            }
+                        }
+                    }
+                } else {
+                    ui.colored_label(egui::Color32::from_rgb(100, 200, 100), "APO is installed (up to date).");
+                }
+
+                // ── HRTF on/off toggle ──
+                if apo_installed {
+                    ui.add_space(4.0);
+                    // Sync state from shared memory on first read
+                    if let Some(ref ctrl) = self.bypass_control {
+                        self.hrtf_enabled = !ctrl.is_bypassed();
+                    }
+                    let prev = self.hrtf_enabled;
+                    let label = if self.hrtf_enabled { "HRTF: ON" } else { "HRTF: OFF" };
+                    ui.toggle_value(&mut self.hrtf_enabled, label);
+                    if self.hrtf_enabled != prev {
+                        if let Some(ref ctrl) = self.bypass_control {
+                            ctrl.set_bypassed(!self.hrtf_enabled);
+                        }
+                    }
+                }
+
+                // ── Step 2: Associate with endpoint ──
+                if apo_installed || self.apo_export_message.as_ref().map_or(false, |m| m.0) {
+                    ui.add_space(4.0);
+                    ui.label("Step 2: Select audio endpoint (your headphones)");
+
+                    if self.apo_endpoints.is_empty() {
+                        if ui.button("Refresh audio devices").clicked() {
+                            self.apo_endpoints = apo_install::list_audio_endpoints().unwrap_or_default();
+                        }
+                    }
+
+                    for (idx, name) in &self.apo_endpoints {
+                        let selected = self.apo_selected_endpoint == Some(*idx);
+                        if ui.selectable_label(selected, name).clicked() {
+                            self.apo_selected_endpoint = Some(*idx);
+                            match apo_install::associate_endpoint(*idx) {
+                                Ok(device_name) => {
+                                    self.apo_export_message = Some((
+                                        true,
+                                        format!("APO associated with: {device_name}"),
+                                    ));
+                                }
+                                Err(e) => {
+                                    self.apo_export_message = Some((false, format!("Associate failed: {e}")));
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // ── Step 3: Export HRTF & Apply ──
+                ui.add_space(8.0);
+                ui.label("Step 3: Export your personalized HRTF");
+
+                let can_export = self.model_error.is_none()
+                    && self.model_path.exists()
+                    && matches!(self.synth_state, SynthState::Idle | SynthState::Complete { .. });
+
+                if ui
+                    .add_enabled(
+                        can_export,
+                        egui::Button::new("Export HRTF & Apply").min_size(egui::vec2(200.0, 30.0)),
+                    )
+                    .on_hover_text("Synthesize, export IRs, and restart audio service")
+                    .clicked()
+                {
+                    self.export_for_apo();
+                }
+
+                if ir_exists && self.apo_export_message.is_none() {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(100, 200, 100),
+                        "Personalized IRs are active.",
+                    );
+                }
+
+                // ── Status messages ──
+                if let Some((is_success, ref msg)) = self.apo_export_message {
+                    let color = if is_success {
+                        egui::Color32::from_rgb(100, 255, 100)
+                    } else {
+                        egui::Color32::from_rgb(255, 100, 100)
+                    };
+                    ui.colored_label(color, msg.as_str());
+                }
+            });
+    }
+
+    fn export_for_apo(&mut self) {
+        self.apo_export_message = None;
+        self.validation_errors.clear();
+
+        // Parse inputs (same validation as start_synthesis)
+        let head_width = match self.head_width.trim().parse::<f32>() {
+            Ok(v) if (10.0..=25.0).contains(&v) => v,
+            _ => {
+                self.apo_export_message = Some((false, "Invalid head width.".into()));
+                return;
+            }
+        };
+        let head_depth = match self.head_depth.trim().parse::<f32>() {
+            Ok(v) if (15.0..=30.0).contains(&v) => v,
+            _ => {
+                self.apo_export_message = Some((false, "Invalid head depth.".into()));
+                return;
+            }
+        };
+
+        let mut ear_left = [0.0f32; 6];
+        let mut ear_right = [0.0f32; 6];
+        for i in 0..6 {
+            ear_left[i] = match self.ear_left[i].trim().parse::<f32>() {
+                Ok(v) if (0.1..=8.0).contains(&v) => v,
+                _ => {
+                    self.apo_export_message = Some((false, format!("Invalid left ear param {}", i + 1)));
+                    return;
+                }
+            };
+            let src = if self.mirror_ears { &self.ear_left[i] } else { &self.ear_right[i] };
+            ear_right[i] = match src.trim().parse::<f32>() {
+                Ok(v) if (0.1..=8.0).contains(&v) => v,
+                _ => {
+                    self.apo_export_message = Some((false, format!("Invalid right ear param {}", i + 1)));
+                    return;
+                }
+            };
+        }
+
+        // Synthesize and export
+        let config = crate::Config {
+            sample_rate: self.sample_rate,
+            ..Default::default()
+        };
+
+        let synthesizer = match crate::HrtfSynthesizer::load(&self.model_path, config) {
+            Ok(s) => s,
+            Err(e) => {
+                self.apo_export_message = Some((false, format!("Model load failed: {e}")));
+                return;
+            }
+        };
+
+        let anthro = crate::Anthropometry {
+            head_width,
+            head_depth,
+            ear_params_left: ear_left,
+            ear_params_right: ear_right,
+        };
+
+        let hrtf_data = synthesizer.synthesize(&anthro);
+        let speaker_irs = crate::SpeakerIrSet::from_hrtf_data(&hrtf_data);
+
+        // Write to ProgramData
+        let program_data = std::env::var("ProgramData").unwrap_or_else(|_| r"C:\ProgramData".into());
+        let ir_path = std::path::PathBuf::from(program_data).join("HrtfApo").join("hrtf_irs.bin");
+
+        match speaker_irs.save(&ir_path) {
+            Ok(()) => {
+                // Restart Windows Audio Service so the APO picks up new IRs
+                let restart_ok = restart_audio_service();
+                let msg = if restart_ok {
+                    format!("Exported and audio service restarted. HRTF is now active.")
+                } else {
+                    format!("Exported to {}. Could not restart audio service — restart manually:\n  net stop audiosrv && net start audiosrv", ir_path.display())
+                };
+                self.apo_export_message = Some((true, msg));
+            }
+            Err(e) => {
+                self.apo_export_message = Some((false, format!("Export failed: {e}")));
+            }
+        }
+    }
+
     fn start_synthesis(&mut self) {
         self.validation_errors.clear();
 
@@ -406,9 +642,16 @@ impl HrtfApp {
 }
 
 /// Search for the model file in common locations
+/// Embedded model binary (8.8MB, compiled in)
+const EMBEDDED_MODEL: &[u8] = include_bytes!(env!("HRTF_MODEL_PATH"));
+
 fn find_model_path() -> Option<PathBuf> {
+    // First check common file locations
     let candidates = [
-        // Relative to executable
+        std::env::current_exe().ok().and_then(|p| {
+            p.parent()
+                .map(|dir| dir.join("../../models/hrtf_model.bin"))
+        }),
         std::env::current_exe().ok().and_then(|p| {
             p.parent()
                 .map(|dir| dir.join("../models/hrtf_model.bin"))
@@ -416,9 +659,7 @@ fn find_model_path() -> Option<PathBuf> {
         std::env::current_exe()
             .ok()
             .and_then(|p| p.parent().map(|dir| dir.join("hrtf_model.bin"))),
-        // Relative to CWD
         Some(PathBuf::from("models/hrtf_model.bin")),
-        Some(PathBuf::from("../models/hrtf_model.bin")),
     ];
 
     for candidate in candidates.into_iter().flatten() {
@@ -427,5 +668,27 @@ fn find_model_path() -> Option<PathBuf> {
         }
     }
 
+    // Fall back to extracting the embedded model
+    if !EMBEDDED_MODEL.is_empty() {
+        let dir = std::env::temp_dir().join("hrtf_synth");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("hrtf_model.bin");
+        if std::fs::write(&path, EMBEDDED_MODEL).is_ok() {
+            return Some(path);
+        }
+    }
+
     None
 }
+
+/// Restart the Windows Audio Service so the APO picks up new IRs.
+fn restart_audio_service() -> bool {
+    use std::process::Command;
+    let stop = Command::new("net").args(["stop", "audiosrv"]).output();
+    let start = Command::new("net").args(["start", "audiosrv"]).output();
+    match (stop, start) {
+        (Ok(s), Ok(r)) => s.status.success() && r.status.success(),
+        _ => false,
+    }
+}
+

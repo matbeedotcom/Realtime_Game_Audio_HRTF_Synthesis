@@ -5,7 +5,7 @@ edition = "2021"
 authors = ["HRTF Synthesis Project"]
 description = "Synthesize personalized HRTFs from anthropometric measurements"
 license = "MIT"
-repository = "https://github.com/your-username/hrtf-synth"
+repository = "https://github.com/matbeedotcom/Realtime_Game_Audio_HRTF_Synthesis"
 keywords = ["hrtf", "audio", "binaural", "spatial-audio"]
 categories = ["multimedia::audio", "science"]
 
@@ -20,9 +20,6 @@ num-complex = "0.4"
 # Audio I/O
 hound = "3.5"
 
-# CLI
-clap = { version = "4.5", features = ["derive"] }
-
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
 bincode = "1.3"
@@ -31,21 +28,18 @@ bincode = "1.3"
 thiserror = "1.0"
 anyhow = "1.0"
 
-# Parallel processing
-rayon = "1.10"
-
-# Progress bar
-indicatif = "0.17"
+# CLI (optional — not needed when used as a library)
+clap = { version = "4.5", features = ["derive"], optional = true }
+rayon = { version = "1.10", optional = true }
+indicatif = { version = "0.17", optional = true }
 
 [dev-dependencies]
-# Testing
 approx = "0.5"
 
 [features]
-default = []
-# Optional GUI support
-gui = ["dep:eframe", "dep:egui", "dep:rfd"]
-# SOFA file support (requires HDF5)
+default = ["cli"]
+cli = ["dep:clap", "dep:rayon", "dep:indicatif"]
+gui = ["cli", "dep:eframe", "dep:egui", "dep:rfd", "dep:windows", "dep:windows-core"]
 sofa = ["dep:hdf5"]
 
 [dependencies.eframe]
@@ -64,16 +58,31 @@ optional = true
 version = "0.8"
 optional = true
 
+[dependencies.windows]
+version = "0.58"
+optional = true
+features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_System_Registry",
+    "Win32_System_Memory",
+    "Win32_Security",
+    "Win32_Media_Audio",
+    "Win32_Media_Audio_Apo",
+    "Win32_UI_Shell_PropertiesSystem",
+    "Win32_Devices_FunctionDiscovery",
+]
+
+[dependencies.windows-core]
+version = "0.58"
+optional = true
+
 [[bin]]
 name = "hrtf-synth"
 path = "src/main.rs"
+required-features = ["cli"]
 
 [[bin]]
 name = "hrtf-synth-gui"
 path = "src/gui_main.rs"
 required-features = ["gui"]
-
-[profile.release]
-lto = true
-codegen-units = 1
-opt-level = 3

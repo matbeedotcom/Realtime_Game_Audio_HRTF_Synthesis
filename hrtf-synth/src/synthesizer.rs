@@ -3,6 +3,7 @@
 use std::path::Path;
 
 use nalgebra::DVector;
+#[cfg(feature = "cli")]
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -199,9 +200,20 @@ impl HrtfSynthesizer {
         let input_left = anthro.to_input_left();
         let input_right = anthro.to_input_right();
 
-        // Synthesize each direction (in parallel)
+        // Synthesize each direction
+        #[cfg(feature = "cli")]
         let results: Vec<_> = (0..n_dirs)
             .into_par_iter()
+            .map(|dir_idx| {
+                let (ir_left, ir_right) =
+                    self.synthesize_direction(dir_idx, &input_left, &input_right, anthro);
+                progress(dir_idx);
+                (dir_idx, ir_left, ir_right)
+            })
+            .collect();
+
+        #[cfg(not(feature = "cli"))]
+        let results: Vec<_> = (0..n_dirs)
             .map(|dir_idx| {
                 let (ir_left, ir_right) =
                     self.synthesize_direction(dir_idx, &input_left, &input_right, anthro);

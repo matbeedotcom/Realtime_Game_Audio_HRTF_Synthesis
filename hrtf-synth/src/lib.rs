@@ -8,6 +8,8 @@ pub mod dsp;
 pub mod gui;
 pub mod io;
 pub mod nn;
+pub mod speaker_irs;
 pub mod synthesizer;
 
+pub use speaker_irs::SpeakerIrSet;
 pub use synthesizer::{Anthropometry, Config, HrtfData, HrtfSynthesizer};

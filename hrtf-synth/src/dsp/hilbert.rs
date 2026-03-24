@@ -25,34 +25,17 @@ pub fn hilbert_transform(input: &[f32]) -> Vec<f32> {
     // Forward FFT
     let mut spectrum = fft.forward(input);
 
-    // Apply Hilbert transform in frequency domain
-    // DC component (index 0): multiply by 0 (set to 0)
-    spectrum[0] = Complex::new(0.0, 0.0);
+    // Apply Hilbert transform in frequency domain:
+    // Analytic signal = IFFT of one-sided spectrum
+    //   DC (index 0): keep as-is
+    //   Positive frequencies (1 to N/2-1): multiply by 2
+    //   Nyquist (index N/2): keep as-is
+    //   Negative frequencies (N/2+1 to N-1): set to 0
 
-    // Positive frequencies (1 to N/2-1): multiply by 2
     for i in 1..n / 2 {
         spectrum[i] *= 2.0;
     }
 
-    // Nyquist (index N/2): multiply by 0 (set to 0)
-    spectrum[n / 2] = Complex::new(0.0, 0.0);
-
-    // Negative frequencies (N/2+1 to N-1): multiply by 0
-    for i in (n / 2 + 1)..n {
-        spectrum[i] = Complex::new(0.0, 0.0);
-    }
-
-    // The analytic signal is x + j*H{x}
-    // We construct it by zeroing negative frequencies
-
-    // DC stays the same
-    // Positive frequencies (1 to N/2-1): multiply by 2
-    for i in 1..n / 2 {
-        spectrum[i] *= 2.0;
-    }
-
-    // Nyquist stays the same
-    // Negative frequencies: set to 0
     for i in (n / 2 + 1)..n {
         spectrum[i] = Complex::new(0.0, 0.0);
     }

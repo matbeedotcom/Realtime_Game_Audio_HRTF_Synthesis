@@ -113,7 +113,7 @@ pub fn write_hesuvi_custom(
 }
 
 /// Find the closest HRTF position to a given azimuth/elevation
-fn find_closest_position(data: &HrtfData, azimuth: f32, elevation: f32) -> usize {
+pub fn find_closest_position(data: &HrtfData, azimuth: f32, elevation: f32) -> usize {
     let mut min_dist = f32::MAX;
     let mut min_idx = 0;
 

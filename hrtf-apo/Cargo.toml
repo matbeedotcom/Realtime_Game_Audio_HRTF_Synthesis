@@ -1,0 +1,17 @@
+[package]
+name = "hrtf-apo"
+version = "0.1.0"
+edition = "2021"
+description = "Windows Audio Processing Object for personalized HRTF binaural audio"
+license = "MIT"
+build = "build.rs"
+
+[lib]
+crate-type = ["cdylib"]
+name = "hrtf_apo"
+
+[dependencies]
+hrtf-synth = { path = "../hrtf-synth", default-features = false }
+
+[build-dependencies]
+cc = "1"

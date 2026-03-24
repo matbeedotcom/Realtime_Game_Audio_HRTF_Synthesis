@@ -27,3 +27,4 @@ test_Data_augmentation.m
 hrtf-synth/target/
 release-pkg/
 *.zip
+target/
